@@ -1,0 +1,17 @@
+# Rust build artifacts
+codex-rust/codex-rs/target/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db

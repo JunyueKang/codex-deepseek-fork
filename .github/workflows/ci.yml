@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: cargo check (ubuntu)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: codex-rust/codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rust/codex-rs
+      - name: Check
+        run: cargo check -p codex-cli

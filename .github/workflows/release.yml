@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: macOS
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: codex-rust/codex-rs
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rust/codex-rs
+      - name: Build release
+        run: cargo build -p codex-cli --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../../codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz codex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-${{ github.ref_name }}-${{ matrix.target }}
+          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: codex-rust/codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rust/codex-rs
+      - name: Build release
+        run: cargo build -p codex-cli --release
+      - name: Package
+        run: |
+          cd target/release
+          tar -czf ../../../codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz codex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+
+  build-windows:
+    name: Windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: codex-rust/codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rust/codex-rs
+      - name: Build release
+        run: cargo build -p codex-cli --release
+      - name: Package
+        run: |
+          cd target/release
+          7z a ../../../codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip codex.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codex-${{ github.ref_name }}-*
+          merge-multiple: true
+          path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: artifacts/*
+          generate_release_notes: true
