@@ -17,7 +17,7 @@ jobs:
       run:
         working-directory: codex-rust/codex-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
       - uses: Swatinem/rust-cache@v2
         with:

@@ -21,7 +21,7 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
           targets: ${{ matrix.target }}
@@ -32,12 +32,14 @@ jobs:
         run: cargo build -p codex-cli --release --target ${{ matrix.target }}
       - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf ../../../codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz codex
-      - uses: actions/upload-artifact@v4
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf dist/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz codex
+          ls -lh dist
+      - uses: actions/upload-artifact@v7
         with:
           name: codex-${{ github.ref_name }}-${{ matrix.target }}
-          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
 
   build-linux:
     name: Linux
@@ -46,7 +48,7 @@ jobs:
       run:
         working-directory: codex-rust/codex-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -55,12 +57,14 @@ jobs:
         run: cargo build -p codex-cli --release
       - name: Package
         run: |
-          cd target/release
-          tar -czf ../../codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz codex
-      - uses: actions/upload-artifact@v4
+          mkdir -p dist
+          tar -C target/release -czf dist/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz codex
+          ls -lh dist
+      - uses: actions/upload-artifact@v7
         with:
           name: codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu
-          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
 
   build-windows:
     name: Windows
@@ -69,7 +73,7 @@ jobs:
       run:
         working-directory: codex-rust/codex-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -78,19 +82,23 @@ jobs:
         run: cargo build -p codex-cli --release
       - name: Package
         run: |
-          cd target/release
-          7z a ../../codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip codex.exe
-      - uses: actions/upload-artifact@v4
+          New-Item -ItemType Directory -Force dist
+          Push-Location target/release
+          7z a ../../dist/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip codex.exe
+          Pop-Location
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v7
         with:
           name: codex-${{ github.ref_name }}-x86_64-pc-windows-msvc
-          path: codex-rust/codex-rs/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
 
   create-release:
     name: Create GitHub Release
     needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: codex-${{ github.ref_name }}-*
           merge-multiple: true
