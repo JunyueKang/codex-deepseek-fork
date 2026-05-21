@@ -114,15 +114,18 @@ jobs:
         with:
           workspaces: codex-rust/codex-rs
       - name: Build release
-        run: cargo build -p codex-cli --release --target ${{ matrix.target }}
+        env:
+          CARGO_BUILD_JOBS: '1'
+          CARGO_INCREMENTAL: '0'
+        run: cargo build -p codex-cli --release --target ${{ matrix.target }} -j 1
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist
-          $targetDir = "target/${{ matrix.target }}/release"
-          Push-Location $targetDir
-          7z a ../../dist/codex-${{ github.ref_name }}-${{ matrix.target }}.zip codex.exe
-          Pop-Location
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/codex.exe" `
+            -DestinationPath "dist/codex-${{ github.ref_name }}-${{ matrix.target }}.zip" `
+            -Force
           Get-ChildItem dist
       - uses: actions/upload-artifact@v7
         with:
