@@ -15,6 +15,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
@@ -168,8 +169,29 @@ impl<T: HttpTransport> ChatCompletionsClient<T> {
             insert_header(&mut extra_headers, "x-openai-subagent", &subagent);
         }
 
-        let body = serde_json::to_value(ChatCompletionsRequest::from_responses(request))
+        let chat_request = ChatCompletionsRequest::from_responses(request);
+        let body = serde_json::to_value(&chat_request)
             .map_err(|err| ApiError::Stream(format!("failed to encode chat request: {err}")))?;
+        // Write the full request JSON to a file for debugging.
+        if let Ok(json_str) = serde_json::to_string_pretty(&chat_request) {
+            let _ = std::fs::write("/tmp/codex-chat-request.json", &json_str);
+            // Also log just the reasoning fields
+            let mut reasoning_report = String::new();
+            for (i, msg) in chat_request.messages.iter().enumerate() {
+                if msg.role == "assistant" {
+                    reasoning_report.push_str(&format!(
+                        "msg[{}] role={} has_content={} has_reasoning={} has_tool_calls={} reasoning_len={:?}
+",
+                        i, msg.role,
+                        msg.content.is_some(),
+                        msg.reasoning_content.is_some(),
+                        msg.tool_calls.is_some(),
+                        msg.reasoning_content.as_ref().map(|r| r.len()),
+                    ));
+                }
+            }
+            let _ = std::fs::write("/tmp/codex-reasoning-report.txt", &reasoning_report);
+        }
         let stream_response = self
             .session
             .stream_with(
@@ -197,9 +219,19 @@ impl<T: HttpTransport> ChatCompletionsClient<T> {
 
 impl ChatCompletionsRequest {
     fn from_responses(request: ResponsesApiRequest) -> Self {
+        let input_len = request.input.len();
+        let messages = chat_messages_from_response_items(request.instructions, request.input);
+        let msg_count = messages.len();
+        let with_reasoning = messages.iter().filter(|m| m.reasoning_content.is_some()).count();
+        tracing::debug!(
+            total_messages = msg_count,
+            messages_with_reasoning = with_reasoning,
+            input_items = input_len,
+            "ChatCompletionsRequest built"
+        );
         Self {
             model: request.model,
-            messages: chat_messages_from_response_items(request.instructions, request.input),
+            messages,
             tools: chat_tools_from_responses_tools(request.tools),
             tool_choice: request.tool_choice,
             parallel_tool_calls: Some(request.parallel_tool_calls),
@@ -237,42 +269,91 @@ fn chat_messages_from_response_items(
     }
 
     let mut idx = 0;
+    let mut last_reasoning: Option<String> = None;
     while idx < input.len() {
         match &input[idx] {
+            ResponseItem::Reasoning { content, .. } => {
+                // Capture reasoning text for the next Message or tool-call group.
+                if let Some(text) = reasoning_items_to_text(content.as_ref()) {
+                    last_reasoning = Some(text);
+                }
+            }
             ResponseItem::Message {
                 role,
                 content,
-                reasoning_content,
                 ..
-            } => messages.push(ChatMessage {
-                role: chat_message_role(role).to_string(),
-                content: Some(chat_message_content_from_content_items(content.clone())),
-                reasoning_content: reasoning_content.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-            }),
+            } => {
+                let mapped_role = chat_message_role(role);
+                // Only assistant messages carry reasoning_content.
+                let reasoning_content = if mapped_role == "assistant" {
+                    // Reasoning may appear before OR after the Message in the item list.
+                    // Try last_reasoning first (reasoning before message), then peek forward.
+                    let mut rc = last_reasoning.take();
+                    if rc.is_none()
+                        && idx + 1 < input.len()
+                    {
+                        if let ResponseItem::Reasoning { content, .. } = &input[idx + 1] {
+                            rc = reasoning_items_to_text(content.as_ref());
+                            if rc.is_some() {
+                                idx += 1; // consume the next Reasoning item
+                            }
+                        }
+                    }
+                    rc
+                } else {
+                    None
+                };
+                messages.push(ChatMessage {
+                    role: mapped_role.to_string(),
+                    content: Some(chat_message_content_from_content_items(content.clone())),
+                    reasoning_content,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
             ResponseItem::FunctionCall { .. } | ResponseItem::CustomToolCall { .. } => {
-                let (next_idx, message_group) = collect_complete_tool_call_group(&input, idx);
+                let (next_idx, message_group) =
+                    collect_complete_tool_call_group(&input, idx, last_reasoning.take());
                 messages.extend(message_group);
                 idx = next_idx;
                 continue;
             }
             ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
             }
-            ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
+            ResponseItem::LocalShellCall { .. }
             | ResponseItem::ToolSearchCall { .. }
             | ResponseItem::ToolSearchOutput { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::ContextCompaction { .. }
+            | ResponseItem::CompactionTrigger
             | ResponseItem::Other => {}
         }
         idx += 1;
     }
 
     messages
+}
+
+/// Extracts the text content from a Reasoning item if present at the given index.
+
+/// Collects reasoning text from `ReasoningItemContent` items.
+fn reasoning_items_to_text(content: Option<&Vec<ReasoningItemContent>>) -> Option<String> {
+    let items = content?;
+    let texts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text } => {
+                Some(text.as_str())
+            }
+        })
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
 }
 
 fn chat_message_role(role: &str) -> &str {
@@ -285,26 +366,23 @@ fn chat_message_role(role: &str) -> &str {
 fn collect_complete_tool_call_group(
     input: &[ResponseItem],
     start_idx: usize,
+    preceding_reasoning: Option<String>,
 ) -> (usize, Vec<ChatMessage>) {
     let mut idx = start_idx;
     let mut calls = Vec::new();
     let mut call_ids = Vec::new();
-    let mut reasoning_content = Vec::new();
+    let mut reasoning_content: Vec<String> = preceding_reasoning
+        .into_iter()
+        .collect();
     while idx < input.len() {
         match &input[idx] {
             ResponseItem::FunctionCall {
                 name,
                 arguments,
                 call_id,
-                reasoning_content: item_reasoning_content,
                 ..
             } => {
                 call_ids.push(call_id.clone());
-                if let Some(item_reasoning_content) = item_reasoning_content
-                    && !item_reasoning_content.is_empty()
-                {
-                    reasoning_content.push(item_reasoning_content.clone());
-                }
                 calls.push(ChatToolCall {
                     id: call_id.clone(),
                     kind: "function",
@@ -319,15 +397,9 @@ fn collect_complete_tool_call_group(
                 call_id,
                 name,
                 input: tool_input,
-                reasoning_content: item_reasoning_content,
                 ..
             } => {
                 call_ids.push(call_id.clone());
-                if let Some(item_reasoning_content) = item_reasoning_content
-                    && !item_reasoning_content.is_empty()
-                {
-                    reasoning_content.push(item_reasoning_content.clone());
-                }
                 calls.push(ChatToolCall {
                     id: call_id.clone(),
                     kind: "function",
@@ -338,7 +410,12 @@ fn collect_complete_tool_call_group(
                 });
                 idx += 1;
             }
-            ResponseItem::Reasoning { .. } => {
+            ResponseItem::Reasoning { content, .. } => {
+                // Collect reasoning text. In v0.132.0, reasoning is a separate
+                // ResponseItem variant, not a field on FunctionCall/CustomToolCall.
+                if let Some(text) = reasoning_items_to_text(content.as_ref()) {
+                    reasoning_content.push(text);
+                }
                 idx += 1;
             }
             _ => break,
@@ -414,10 +491,8 @@ fn chat_message_content_from_content_items(content: Vec<ContentItem>) -> ChatMes
 
 fn chat_image_detail(detail: ImageDetail) -> String {
     match detail {
-        ImageDetail::Auto => "auto",
-        ImageDetail::Low => "low",
+        ImageDetail::Original => "original",
         ImageDetail::High => "high",
-        ImageDetail::Original => "auto",
     }
     .to_string()
 }
@@ -455,4 +530,98 @@ fn chat_tools_from_responses_tools(tools: Vec<Value>) -> Vec<Value> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ReasoningItemContent;
+    use codex_protocol::models::ResponseItem;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn reasoning_before_function_call_is_passed_as_reasoning_content() {
+        // Simulate: [Reasoning, FunctionCall, FunctionCallOutput]
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: "r1".into(),
+                summary: vec![],
+                content: Some(vec![ReasoningItemContent::ReasoningText {
+                    text: "Let me check the time".into(),
+                }]),
+                encrypted_content: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".into(),
+                namespace: None,
+                arguments: r#"{"cmd":"date"}"#.into(),
+                call_id: "call_1".into(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_1".into(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("2026-05-21 13:38:39 HKT".into()),
+                    success: None,
+                },
+            },
+        ];
+
+        let messages = chat_messages_from_response_items(String::new(), items);
+
+        // Should produce: tool role assistant message + tool result message
+        assert_eq!(messages.len(), 2);
+
+        let assistant = &messages[0];
+        assert_eq!(assistant.role, "assistant");
+        assert!(
+            assistant.reasoning_content.is_some(),
+            "assistant message should have reasoning_content"
+        );
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("Let me check the time"),
+        );
+    }
+
+    #[test]
+    fn reasoning_after_message_is_passed_as_reasoning_content() {
+        // Simulate the SSE parser output: [Message, Reasoning]
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText {
+                    text: "It is 13:38 HKT".into(),
+                }],
+                phase: None,
+            },
+            ResponseItem::Reasoning {
+                id: "r1".into(),
+                summary: vec![],
+                content: Some(vec![ReasoningItemContent::ReasoningText {
+                    text: "The time is 13:38".into(),
+                }]),
+                encrypted_content: None,
+            },
+        ];
+
+        let messages = chat_messages_from_response_items(String::new(), items);
+
+        assert_eq!(messages.len(), 1);
+
+        let assistant = &messages[0];
+        assert_eq!(assistant.role, "assistant");
+        assert!(
+            assistant.reasoning_content.is_some(),
+            "assistant message should have reasoning_content"
+        );
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("The time is 13:38"),
+        );
+    }
 }

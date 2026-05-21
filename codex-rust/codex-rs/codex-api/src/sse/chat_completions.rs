@@ -5,6 +5,7 @@ use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
@@ -297,22 +298,69 @@ async fn ensure_assistant_item_started(
             .unwrap_or("chat_completion_response")
     );
     state.assistant_item_id = Some(item_id.clone());
+    // v0.132.0: ResponseItem::Message does NOT have a reasoning_content field.
+    // Reasoning is emitted as a separate ResponseItem::Reasoning variant.
     tx_event
         .send(Ok(ResponseEvent::OutputItemAdded(ResponseItem::Message {
             id: Some(item_id),
             role: "assistant".to_string(),
             content: Vec::new(),
             phase: None,
-            reasoning_content: None,
         })))
         .await
         .map_err(|_| ())
+}
+
+/// Extracts reasoning text for emission as ResponseItem::Reasoning events.
+/// Emits a separate ResponseItem::Reasoning event for accumulated reasoning content.
+async fn emit_reasoning_item(
+    state: &mut ChatCompletionState,
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+) -> Result<(), ()> {
+    let reasoning_text = std::mem::take(&mut state.reasoning_content);
+    if reasoning_text.is_empty() {
+        return Ok(());
+    }
+    let reasoning_id = format!(
+        "{}_reasoning",
+        state
+            .response_id
+            .as_deref()
+            .unwrap_or("chat_completion_response")
+    );
+    let content = vec![ReasoningItemContent::ReasoningText {
+        text: reasoning_text.clone(),
+    }];
+    tx_event
+        .send(Ok(ResponseEvent::OutputItemAdded(ResponseItem::Reasoning {
+            id: reasoning_id.clone(),
+            summary: Vec::new(),
+            content: Some(content.clone()),
+            encrypted_content: None,
+        })))
+        .await
+        .map_err(|_| ())?;
+    tx_event
+        .send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+            id: reasoning_id,
+            summary: Vec::new(),
+            content: Some(content),
+            encrypted_content: None,
+        })))
+        .await
+        .map_err(|_| ())?;
+    Ok(())
 }
 
 async fn finish_chat_stream(
     state: &mut ChatCompletionState,
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
 ) {
+    // Emit reasoning as a separate ResponseItem::Reasoning before the message item
+    if emit_reasoning_item(state, tx_event).await.is_err() {
+        return;
+    }
+
     if !state.assistant_text.is_empty()
         && tx_event
             .send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
@@ -322,7 +370,6 @@ async fn finish_chat_stream(
                     text: std::mem::take(&mut state.assistant_text),
                 }],
                 phase: None,
-                reasoning_content: non_empty_reasoning_content(state),
             })))
             .await
             .is_err()
@@ -350,7 +397,6 @@ async fn finish_chat_stream(
                     namespace: None,
                     arguments: call.arguments,
                     call_id,
-                    reasoning_content: non_empty_reasoning_content(state),
                 },
             )))
             .await
@@ -371,10 +417,6 @@ async fn finish_chat_stream(
             end_turn: None,
         }))
         .await;
-}
-
-fn non_empty_reasoning_content(state: &ChatCompletionState) -> Option<String> {
-    (!state.reasoning_content.is_empty()).then(|| state.reasoning_content.clone())
 }
 
 #[cfg(test)]

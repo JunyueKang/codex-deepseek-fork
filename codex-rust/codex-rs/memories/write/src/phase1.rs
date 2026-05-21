@@ -298,7 +298,6 @@ mod job {
                 )?,
             }],
             phase: None,
-            reasoning_content: None,
         }];
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
@@ -418,7 +417,6 @@ mod job {
             role,
             content,
             phase,
-            reasoning_content,
         } = item
         else {
             return should_persist_response_item_for_memories(item).then(|| item.clone());
@@ -446,7 +444,6 @@ mod job {
             role: role.clone(),
             content,
             phase: phase.clone(),
-            reasoning_content: reasoning_content.clone(),
         })
     }
 

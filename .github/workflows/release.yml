@@ -42,60 +42,103 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    name: Linux
-    runs-on: ubuntu-latest
+    name: Linux (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: codex-rust/codex-rs
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rust/codex-rs
+      - name: Build release
+        run: cargo build -p codex-cli --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf dist/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz codex
+          ls -lh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: codex-${{ github.ref_name }}-${{ matrix.target }}
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  build-linux-aarch64:
+    name: Linux (aarch64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: codex-rust/codex-rs
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rust/codex-rs
       - name: Build release
-        run: cargo build -p codex-cli --release
+        run: cargo build -p codex-cli --release --target aarch64-unknown-linux-gnu
       - name: Package
         run: |
           mkdir -p dist
-          tar -C target/release -czf dist/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz codex
+          tar -C target/aarch64-unknown-linux-gnu/release -czf dist/codex-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz codex
           ls -lh dist
       - uses: actions/upload-artifact@v7
         with:
-          name: codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu
-          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+          name: codex-${{ github.ref_name }}-aarch64-unknown-linux-gnu
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
           if-no-files-found: error
 
   build-windows:
-    name: Windows
+    name: Windows (${{ matrix.target }})
     runs-on: windows-latest
     defaults:
       run:
         working-directory: codex-rust/codex-rs
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rust/codex-rs
       - name: Build release
-        run: cargo build -p codex-cli --release
+        run: cargo build -p codex-cli --release --target ${{ matrix.target }}
       - name: Package
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist
-          Push-Location target/release
-          7z a ../../dist/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip codex.exe
+          $targetDir = "target/${{ matrix.target }}/release"
+          Push-Location $targetDir
+          7z a ../../dist/codex-${{ github.ref_name }}-${{ matrix.target }}.zip codex.exe
           Pop-Location
           Get-ChildItem dist
       - uses: actions/upload-artifact@v7
         with:
-          name: codex-${{ github.ref_name }}-x86_64-pc-windows-msvc
-          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+          name: codex-${{ github.ref_name }}-${{ matrix.target }}
+          path: codex-rust/codex-rs/dist/codex-${{ github.ref_name }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
   create-release:
     name: Create GitHub Release
-    needs: [build-macos, build-linux, build-windows]
+    needs: [build-macos, build-linux, build-linux-aarch64, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

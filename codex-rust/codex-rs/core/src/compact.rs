@@ -510,7 +510,6 @@ fn build_compacted_history_with_limit(
                 text: message.clone(),
             }],
             phase: None,
-            reasoning_content: None,
         });
     }
 
@@ -525,7 +524,6 @@ fn build_compacted_history_with_limit(
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: summary_text }],
         phase: None,
-        reasoning_content: None,
     });
 
     history

@@ -82,7 +82,6 @@ pub trait ContextualUserFragment {
                 text: self.render(),
             }],
             phase: None,
-            reasoning_content: None,
         }
     }
 }

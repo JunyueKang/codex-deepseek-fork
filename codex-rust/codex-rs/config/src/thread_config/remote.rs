@@ -4,9 +4,9 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use codex_model_provider_info::ModelMetadataSource;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_model_provider_info::ModelMetadataSource;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 

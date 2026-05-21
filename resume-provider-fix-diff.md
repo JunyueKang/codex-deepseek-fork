@@ -1429,3 +1429,153 @@ context_window = 1000000
 cargo check -p codex-model-provider-info -p codex-model-provider -p codex-config
 cargo check -p codex-cli
 ```
+
+
+## E. 适配 v0.132.0 的协议变更
+
+v0.130.0 到 v0.132.0 之间协议层有显著重构，以下是在 v0.132.0 上实施上述功能时必须注意的差异和额外改动。
+
+### 核心差异：`reasoning_content` 从字段变成独立 variant
+
+在 v0.130.0 中，`reasoning_content: Option<String>` 是 `ResponseItem::Message`、`ResponseItem::FunctionCall`、`ResponseItem::CustomToolCall` 的直接字段。推理内容和消息/工具调用存储在同一个 item 中。
+
+v0.132.0 重构为：
+- `ResponseItem::Message` 不再有 `reasoning_content` 字段
+- `ResponseItem::FunctionCall` 不再有 `reasoning_content` 字段
+- `ResponseItem::CustomToolCall` 不再有 `reasoning_content` 字段
+- 新增独立的 `ResponseItem::Reasoning` variant：
+
+```rust
+ResponseItem::Reasoning {
+    id: String,
+    summary: Vec<ReasoningItemReasoningSummary>,
+    content: Option<Vec<ReasoningItemContent>>,
+    encrypted_content: Option<String>,
+}
+```
+
+其中 `ReasoningItemContent` 有两种变体：
+```rust
+pub enum ReasoningItemContent {
+    ReasoningText { text: String },
+    Text { text: String },
+}
+```
+
+### E.1 SSE 解析器适配：`codex-api/src/sse/chat_completions.rs`
+
+v0.130.0 的做法是将推理文本直接写在 `ResponseItem::Message { reasoning_content: Some(text) }` 上。v0.132.0 需要改为发送独立的 `ResponseItem::Reasoning` item。
+
+**改动**：
+- 新增 `emit_reasoning_item()` 函数，发送 `OutputItemAdded(Reasoning{...})` + `OutputItemDone(Reasoning{...})` 事件
+- `OutputItemDone` 的 `content` 必须携带完整推理文本（不能设为 `None` 或空字符串），因为 session handler 在 `OutputItemDone` 时重新调用 `parse_turn_item()`，会用 Done 事件的内容覆盖 Added 的内容
+- 在 `finish_chat_stream()` 中，先调用 `emit_reasoning_item()` 再发送 `OutputItemDone(Message)` 和 `OutputItemDone(FunctionCall)`
+- 移除 `ResponseItem::Message` 和 `ResponseItem::FunctionCall` 构造中的 `reasoning_content` 字段
+
+**新增的 `emit_reasoning_item` 关键代码**：
+```rust
+async fn emit_reasoning_item(
+    state: &mut ChatCompletionState,
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+) -> Result<(), ()> {
+    let reasoning_text = std::mem::take(&mut state.reasoning_content);
+    if reasoning_text.is_empty() { return Ok(()); }
+    let reasoning_id = format!("{}_reasoning", ...);
+    let content = vec![ReasoningItemContent::ReasoningText {
+        text: reasoning_text.clone(),
+    }];
+    // OutputItemAdded — 携带完整内容
+    tx_event.send(Ok(ResponseEvent::OutputItemAdded(ResponseItem::Reasoning {
+        id: reasoning_id.clone(), summary: vec![], content: Some(content.clone()),
+        encrypted_content: None,
+    }))).await?;
+    // OutputItemDone — 必须也携带完整内容（不能用 None 或空字符串）
+    tx_event.send(Ok(ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+        id: reasoning_id, summary: vec![], content: Some(content),
+        encrypted_content: None,
+    }))).await?;
+    Ok(())
+}
+```
+
+> **⚠️ 踩坑点**：`OutputItemDone(Reasoning { content: None })` 会导致 session handler 重新解析时产生空 `raw_content`，覆盖 `OutputItemAdded` 中的实际推理文本。详见 E.3。
+
+### E.2 Endpoint 适配器重构：`codex-api/src/endpoint/chat_completions.rs`
+
+v0.130.0 的 `chat_messages_from_response_items()` 直接从 `ResponseItem::Message { reasoning_content, .. }` 解构并传递。v0.132.0 中 `reasoning_content` 来自独立的 `ResponseItem::Reasoning` item。
+
+**改动**：
+- 新增 `reasoning_items_to_text()` 辅助函数，从 `Option<&Vec<ReasoningItemContent>>` 提取纯文本
+- 使用 `last_reasoning: Option<String>` 状态变量跟踪「上一个遇到的 Reasoning item 的文本」
+- 遍历输入 items 时：
+  - 遇到 `ResponseItem::Reasoning` → 存入 `last_reasoning`
+  - 遇到 `ResponseItem::Message`（仅限 `role == "assistant"`）→ 消费 `last_reasoning.take()`，同时 forward-peek `idx+1` 是否有 Reasoning（兼容 Reasoning 在 Message 之后的顺序）
+  - 遇到 `ResponseItem::FunctionCall` / `ResponseItem::CustomToolCall` → 将 `last_reasoning.take()` 作为 `preceding_reasoning` 传给 `collect_complete_tool_call_group()`
+- `collect_complete_tool_call_group()` 新增 `preceding_reasoning` 参数，并在内部迭代时额外收集遇到的 Reasoning item 文本
+
+**关键代码**：
+```rust
+let mut last_reasoning: Option<String> = None;
+while idx < input.len() {
+    match &input[idx] {
+        ResponseItem::Reasoning { content, .. } => {
+            if let Some(text) = reasoning_items_to_text(content.as_ref()) {
+                last_reasoning = Some(text);
+            }
+        }
+        ResponseItem::Message { role, content, .. } => {
+            let mapped_role = chat_message_role(role);
+            // ⚠️ 只有 assistant 消息才携带 reasoning_content
+            let reasoning_content = if mapped_role == "assistant" {
+                let mut rc = last_reasoning.take();
+                if rc.is_none() && idx + 1 < input.len() {
+                    if let ResponseItem::Reasoning { content, .. } = &input[idx + 1] {
+                        rc = reasoning_items_to_text(content.as_ref());
+                        if rc.is_some() { idx += 1; }
+                    }
+                }
+                rc
+            } else { None };
+            messages.push(ChatMessage { role: mapped_role, ..., reasoning_content, ... });
+        }
+        ResponseItem::FunctionCall { .. } | ResponseItem::CustomToolCall { .. } => {
+            let (next_idx, group) =
+                collect_complete_tool_call_group(&input, idx, last_reasoning.take());
+            messages.extend(group);
+            idx = next_idx;
+            continue;
+        }
+        ...
+    }
+    idx += 1;
+}
+```
+
+### E.3 踩坑记录：`reasoning_content` 被 user 消息错误消费
+
+**现象**：运行 `--yolo "echo hello"` 后，第二段请求（携带 tool result 回传）始终报：
+```
+{"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}
+```
+
+**排查**：在 `ChatCompletionsClient::stream_request()` 中把请求 JSON dump 到 `/tmp/codex-chat-request.json`，发现：
+```
+msg[2]: role=user, reasoning_len=67    ← user 消息竟然有 reasoning_content
+msg[3]: role=assistant, has_reasoning=False, has_tool_calls=True  ← assistant 反而没有
+```
+
+**根因**：session 中 items 顺序为 `[UserMessage, Reasoning, FunctionCall]`。`chat_messages_from_response_items()` 原版对**所有 role 的 Message 都无条件 `last_reasoning.take()`**，导致：
+1. `UserMessage` 先消费了 `last_reasoning` → 得到一个不该有的 `reasoning_content`
+2. 随后的 `FunctionCall` 进入 `collect_complete_tool_call_group(last_reasoning=None)` → assistant ChatMessage 没有 `reasoning_content`
+3. DeepSeek API 校验时发现 assistant 消息缺少 reasoning_content → 报错
+
+**修复**：在 Message 分支中加 `if mapped_role == "assistant"` 守卫，只有 assistant 消息才消费和设置 `reasoning_content`。user/system/developer 消息始终传 `None`。
+
+> **教训**：DeepSeek 的 thinking mode 要求在 **本轮** assistant 的 ChatMessage 中回传上一轮的 `reasoning_content`，且只能挂在 assistant 消息上。适配代码必须严格按 role 分配，不能对所有 Message 一视同仁。
+
+### E.4 其他 v0.132.0 差异
+
+- **`ImageDetail` 枚举简化**：只有 `High` 和 `Original`（无 `Auto`、`Low`），`chat_image_detail()` 映射需调整
+- **`ResponseItem::CompactionTrigger`**：v0.132.0 新增 variant，match 臂需覆盖
+- **`LoaderOverrides.user_config_path`**：从 `Option<AbsolutePathBuf>` + 方法改为 `Option<PathBuf>` 字段，需更新所有引用点（`exec/src/lib.rs`、`tui/src/lib.rs`、`cli/src/main.rs`、`app-server/src/config_manager.rs`）
+- **`FunctionCallOutputPayload`** 新增 `success: Option<bool>` 字段
